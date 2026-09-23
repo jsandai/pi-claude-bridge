@@ -391,14 +391,35 @@ function newAssistantOutput(model: Model<any>, text: string, stopReason: Assista
 }
 
 function extractIsolatedSummaryPrompt(messages: Context["messages"]): string {
-	if (messages.length !== 1 || messages[0].role !== "user") {
-		throw new Error(
-			`isolatedStreamFn: expected exactly 1 user message, got ${messages.length} ` +
-			`(${messages.map((m) => m.role).join(",")})`,
-		);
+	// Single user message: the compaction/branch-summary shape — pass it through
+	// untouched so the prompt CC sees is exactly what pi composed.
+	if (messages.length === 1 && messages[0].role === "user") {
+		const promptText = extractUserPrompt(messages);
+		if (!promptText) throw new Error("isolatedStreamFn: summarization prompt is empty");
+		return promptText;
 	}
-	const promptText = extractUserPrompt(messages);
-	if (!promptText) throw new Error("isolatedStreamFn: summarization prompt is empty");
+	// Multi-message contexts come from external completeSimple callers (e.g. an
+	// advisor extension replaying the session transcript). There is no CC session
+	// to resume them into — persistSession is false — so the only way to hand them
+	// over is folded into one prompt. Role labels are what the model needs to
+	// attribute content; tool calls/results flatten to text like convertPiMessages
+	// does for real session records.
+	// Any non-empty transcript folds: a replayed session can end on any role —
+	// after flattening into one SDK user prompt, a trailing [assistant] or
+	// [toolResult] block is quoted text, not an API prefill the model must
+	// continue from. Only an empty context is unanswerable.
+	if (messages.length === 0) {
+		throw new Error(`isolatedStreamFn: empty context, nothing to fold`);
+	}
+	const lines: string[] = [];
+	for (const m of messages) {
+		const content = (m as { content?: unknown }).content;
+		const text = typeof content === "string" ? content : messageContentToText(content as Parameters<typeof messageContentToText>[0]);
+		if (!text) continue;
+		lines.push(`[${m.role}]\n${text}`);
+	}
+	const promptText = lines.join("\n\n");
+	if (!promptText) throw new Error("isolatedStreamFn: prompt is empty");
 	return promptText;
 }
 
@@ -431,9 +452,9 @@ function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
-function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions, label = "compact summary", external?: { rawMessages: Context["messages"]; callerSystemText: string }): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
-	void runIsolatedSummary(model, context, options, stream);
+	void runIsolatedSummary(model, context, options, stream, label, external);
 	return stream;
 }
 
@@ -442,11 +463,24 @@ async function runIsolatedSummary(
 	context: Context,
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
+	label: string,
+	external?: { rawMessages: Context["messages"]; callerSystemText: string },
 ): Promise<void> {
 	// pi delivers compaction/branch-summary requests as a transcript: the summarization
 	// prompt folded into a leading system message ahead of the lone user message
 	// (issue #106). toBridgeContext restores the prompt/tools fields the extraction
 	// assertion below assumes; the summarization prompt still reaches CC as its systemPrompt.
+	//
+	// External transcript-replay callers (advisor/reviewer) are different: their
+	// messages can carry a REPLAYED session's system messages — including pi's
+	// assembled harness — after their own. getCurrentSystemMessage concatenates
+	// every system message's content, so toBridgeContext would glue the replayed
+	// harness onto the caller's rubric and send the blob as systemPrompt — which
+	// trips the server's third-party plan-eligibility check ("out of extra usage",
+	// diag/EXTRA-USAGE-400.md). The caller passes the RAW pre-toBridgeContext
+	// transcript plus the caller's own initial system message: the replayed
+	// systems fold into the user prompt as [system] quoted material (harmless
+	// there), and only the caller's rubric goes out as systemPrompt.
 	context = toBridgeContext(context);
 	let sdkQuery: ReturnType<typeof query> | undefined;
 	let wasAborted = false;
@@ -463,15 +497,21 @@ async function runIsolatedSummary(
 		// so route on the marker, not on which summarizer is calling. Non-summarizer calls
 		// must still match the [system,user] compaction shape exactly.
 		const isOneOffSummary = options?.cacheRetention === "none";
+		// For external callers, fold the RAW transcript — system messages included
+		// as [system] blocks — so a replayed pi harness reaches the model as quoted
+		// review material inside the user prompt, never as a live system
+		// instruction. For pi's own summarizers, keep the post-toBridgeContext
+		// messages: their system content is the summarization prompt and belongs
+		// in systemPrompt, not the transcript body.
 		const promptText = isOneOffSummary
 			? extractUserPrompt(context.messages)
-			: extractIsolatedSummaryPrompt(context.messages);
+			: extractIsolatedSummaryPrompt(external?.rawMessages ?? context.messages);
 		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
 		const cwd = process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
-		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
+		debug(`${label}: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
 		sdkQuery = query({
 			prompt: promptText,
@@ -484,11 +524,17 @@ async function runIsolatedSummary(
 				settingSources: [] as SettingSource[],
 				skills: [],
 				persistSession: false,
-				systemPrompt: context.systemPrompt,
+				// Only the caller's own instruction — never the aggregated blob that
+				// would include a replayed pi harness (plan-eligibility check).
+				// toBridgeContext's systemPrompt is correct for pi's summarizers (single
+				// recorded prompt) but unsafe for external replays; the external caller's
+				// initial system message is the only live instruction, and a caller with
+				// none gets no systemPrompt rather than the replayed harness.
+				systemPrompt: isOneOffSummary ? context.systemPrompt : (external?.callerSystemText || undefined),
 				model: cliModel,
 				maxTurns: 1,
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-				...makeCliDebugOptions("compact-summary"),
+				...makeCliDebugOptions(label),
 			},
 		});
 
@@ -504,7 +550,7 @@ async function runIsolatedSummary(
 
 		for await (const message of sdkQuery) {
 			if (!firstEventLogged) {
-				debug(`compact summary: first event type=${message.type}`);
+				debug(`${label}: first event type=${message.type}`);
 				firstEventLogged = true;
 			}
 			if (wasAborted) break;
@@ -514,7 +560,7 @@ async function runIsolatedSummary(
 					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
 				}
 			} else if (message.type === "result") {
-				logServedContextWindow("compact summary", message, model);
+				logServedContextWindow(label, message, model);
 				errorText = resultErrorText(message);
 				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
 			}
@@ -522,7 +568,7 @@ async function runIsolatedSummary(
 
 		if (wasAborted) {
 			const output = newAssistantOutput(model, "", "aborted", "Operation aborted");
-			debug("compact summary: aborted");
+			debug(`${label}: aborted`);
 			stream.push({ type: "error", reason: "aborted", error: output });
 			stream.end();
 			return;
@@ -530,14 +576,14 @@ async function runIsolatedSummary(
 
 		const text = finalText || assistantText;
 		if (errorText || !text.trim()) {
-			const msg = errorText ?? "Claude Code summary returned empty text";
-			debug(`compact summary: error ${msg}`);
+			const msg = errorText ?? `Claude Code ${label} returned empty text`;
+			debug(`${label}: error ${msg}`);
 			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 			stream.end();
 			return;
 		}
 
-		debug(`compact summary: done textLen=${text.length}`);
+		debug(`${label}: done textLen=${text.length}`);
 		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
 		stream.end();
 	} catch (err) {
@@ -755,6 +801,7 @@ export const __test = {
 	},
 	toBridgeContext,
 	syncSharedSession,
+	extractIsolatedSummaryPrompt,
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
@@ -1522,6 +1569,31 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
+	// The caller's own tool declaration lives on the initial system message's
+	// toolsAdded — normalizeContext put it there. Capture it before toBridgeContext
+	// strips system messages, because getCurrentTools below aggregates EVERY system
+	// message and would count tools declared inside a replayed transcript (an
+	// advisor replaying a session inherits that session's toolsAdded) as if the
+	// caller had requested them. An external caller declaring no tools must not be
+	// reclassified as tools-present by its transcript's contents.
+	// The caller's own declarations live on the system message normalizeContext
+	// prepends — which it stamps timestamp:0 (createInitialSystemMessage). A
+	// replayed session's system messages carry real timestamps, so index 0 is
+	// only the caller's declaration when it's a zero-stamped system message.
+	// Without that check an external caller that sent no systemPrompt/tools
+	// (hence no prepend) would have a replayed session head's toolsAdded misread
+	// as caller-declared tools — a false-positive tools-present rejection.
+	const head = context.messages[0];
+	const isCallerPrepend = head?.role === "system" && head.timestamp === 0;
+	const callerDeclaredTools = isCallerPrepend
+		? (((head as { toolsAdded?: unknown[] }).toolsAdded?.length ?? 0) > 0)
+		: false;
+	const rawTranscriptMessages = context.messages;
+	const callerSystemText = isCallerPrepend
+		? (typeof head!.content === "string"
+			? head!.content
+			: messageContentToText(head!.content as Parameters<typeof messageContentToText>[0]))
+		: "";
 	// pi hands providers a transcript (prompt/tools folded into system messages) — fold it
 	// back out to the prompt/tools fields every cursor write, syncSharedSession call and
 	// prompt-capture lookup below assumes (issue #106).
@@ -1536,6 +1608,27 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (options?.cacheRetention === "none") {
 		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
 		return isolatedStreamFn(model, context, options);
+	}
+
+	// External completeSimple callers (advisor/reviewer extensions) arrive with a
+	// system prompt no before_agent_start recorded. Classify them before any
+	// tool-result or orphaned-result routing: their transcripts replay session
+	// history and can carry historical toolResult messages that must not be
+	// mistaken for live deliveries into an active query. resolveOrDerive is the
+	// discriminator the main lane lives by; a miss with no tools served means
+	// nothing to project and no session to resume into, so serve as an isolated
+	// query. A tools-present miss still throws — a caller expecting tool use
+	// would otherwise get a silently degraded text-only answer, which is the
+	// instruction-loss class the resolver's throw exists to prevent. Tools are
+	// judged by what the CALLER declared (initial system message), not what the
+	// replayed transcript happens to contain.
+	if (!callerDeclaredTools) {
+		try {
+			promptCaptures.resolveOrDerive(context.systemPrompt);
+		} catch (err) {
+			debug(`provider: unrecorded system prompt with no tools, routing to isolated query (${errorMessage(err)})`);
+			return isolatedStreamFn(model, context, options, "external call", { rawMessages: rawTranscriptMessages, callerSystemText });
+		}
 	}
 
 	const stream = createAssistantMessageEventStream();
