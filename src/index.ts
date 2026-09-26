@@ -785,6 +785,10 @@ function syncSharedSession(
 	return { sessionId: session.sessionId };
 }
 
+/** pi.events channel an extension emits on after rewriting earlier messages in
+ *  place (same count, changed content). Payload: { source, reason, sessionId? }. */
+export const CONTEXT_REWRITTEN_CHANNEL = "context:rewritten";
+
 // @internal
 export const __test = {
 	resetSharedSession() {
@@ -2308,6 +2312,19 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("session_compact", (event) => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`));
 	pi.on("session_tree", () => markRebuild("session_tree"));
+
+	// An extension that rewrites earlier messages in place from its `context`
+	// handler (self-compact's frozen tool-result prune, for one) keeps the
+	// message count, so the count-based REUSE check never notices and CC keeps
+	// resuming the unedited copy. Such an extension announces the rewrite on the
+	// shared bus before the call it applies to; rebuild once so CC imports the
+	// edited history, after which REUSE holds again because pi re-applies the
+	// same edit on every call. An explicit signal rather than hashing content:
+	// a hash would rebuild on every call for any extension that edits per call.
+	pi.events?.on(CONTEXT_REWRITTEN_CHANNEL, (data) => {
+		const { source, reason } = (data ?? {}) as { source?: unknown; reason?: unknown };
+		markRebuild(`${CONTEXT_REWRITTEN_CHANNEL}:${String(source ?? "unknown")}:${String(reason ?? "unspecified")}`);
+	});
 
 	// Branch summarization — rewind or fork-at-point with "summarize" — is the other
 	// place pi asks the model for a summary, and unlike compaction it runs through
