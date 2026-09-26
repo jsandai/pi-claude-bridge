@@ -789,8 +789,14 @@ function syncSharedSession(
  *  place (same count, changed content). Payload: { source, reason, sessionId? }. */
 export const CONTEXT_REWRITTEN_CHANNEL = "context:rewritten";
 
+/** pi.events channel an extension emits on when its session_before_compact handler
+ *  supplies the compaction. Payload: { source, preparation } — the event's own
+ *  preparation object, which pi hands to every handler, so it keys this event only. */
+export const COMPACTION_PROVIDED_CHANNEL = "compaction:provided";
+
 // @internal
 export const __test = {
+	channels: { CONTEXT_REWRITTEN_CHANNEL, COMPACTION_PROVIDED_CHANNEL },
 	resetSharedSession() {
 		sharedSession = null;
 	},
@@ -2264,8 +2270,24 @@ export default function (pi: ExtensionAPI) {
 		clearSession("session_shutdown");
 	});
 
+	// pi keeps the LAST handler's result for session_before_compact, and this
+	// extension loads last. When an earlier extension already supplied the
+	// compaction (self-compact's note-fed summary, which calls the model through
+	// the isolated path and so is safe from the native-compact hang), taking over
+	// would run a second full-history summary and discard theirs. Defer to it; a
+	// handler that passes (overflow, a failed custom summary) announces nothing,
+	// so the takeover still covers those.
+	const providedCompactions = new WeakSet<object>();
+	pi.events?.on(COMPACTION_PROVIDED_CHANNEL, (data) => {
+		const preparation = (data as { preparation?: unknown } | undefined)?.preparation;
+		if (preparation && typeof preparation === "object") providedCompactions.add(preparation);
+	});
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
+		if (providedCompactions.has(event.preparation)) {
+			debug(`session_before_compact: another extension supplied the compaction; deferring (reason=${event.reason})`);
+			return undefined;
+		}
 		debug(
 			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
 			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +

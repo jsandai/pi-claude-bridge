@@ -66,3 +66,50 @@ describe("context:rewritten", () => {
 		assert.doesNotThrow(() => activate({ on: () => {}, registerProvider: () => {}, registerTool: () => {} }));
 	});
 });
+
+describe("compaction:provided", () => {
+	const { COMPACTION_PROVIDED_CHANNEL } = __test.channels;
+
+	function activateWithHandlers() {
+		const handlers = new Map(), listeners = new Map();
+		const events = {
+			on: (channel, handler) => { listeners.set(channel, [...(listeners.get(channel) ?? []), handler]); return () => {}; },
+			emit: (channel, data) => { for (const handler of listeners.get(channel) ?? []) handler(data); },
+		};
+		activate({ on: (event, handler) => handlers.set(event, handler), registerProvider: () => {}, registerTool: () => {}, events });
+		return { handlers, events };
+	}
+
+	const bridgeCtx = { model: { baseUrl: "claude-bridge", id: "claude-opus-5-5" }, ui: {} };
+	const abortedEvent = () => {
+		const controller = new AbortController();
+		controller.abort();
+		return {
+			reason: "threshold", willRetry: false, branchEntries: [], signal: controller.signal,
+			preparation: { messagesToSummarize: [], turnPrefixMessages: [], isSplitTurn: false, firstKeptEntryId: "k", tokensBefore: 1, fileOps: { read: new Set(), edited: new Set() }, settings: {} },
+		};
+	};
+
+	it("uses the documented channel name", () => {
+		assert.equal(COMPACTION_PROVIDED_CHANNEL, "compaction:provided");
+	});
+
+	it("without an announcement the takeover runs (an aborted run cancels)", async () => {
+		const { handlers } = activateWithHandlers();
+		const result = await handlers.get("session_before_compact")(abortedEvent(), bridgeCtx);
+		assert.notEqual(result, undefined, "the bridge took the compaction over");
+	});
+
+	it("defers when an earlier extension announced this event's compaction", async () => {
+		const { handlers, events } = activateWithHandlers();
+		const event = abortedEvent();
+		events.emit(COMPACTION_PROVIDED_CHANNEL, { source: "self-compact", preparation: event.preparation });
+		assert.equal(await handlers.get("session_before_compact")(event, bridgeCtx), undefined);
+	});
+
+	it("an announcement for a different compaction does not suppress this one", async () => {
+		const { handlers, events } = activateWithHandlers();
+		events.emit(COMPACTION_PROVIDED_CHANNEL, { source: "self-compact", preparation: abortedEvent().preparation });
+		assert.notEqual(await handlers.get("session_before_compact")(abortedEvent(), bridgeCtx), undefined);
+	});
+});
