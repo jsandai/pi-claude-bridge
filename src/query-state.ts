@@ -26,6 +26,9 @@ export class QueryContext {
 	 *  to the owning query when several queries are in flight — pairing a result
 	 *  to its call is done by id from Claude's tools/call _meta, not from here. */
 	turnToolCallIds: string[] = [];
+	/** Tears down this context's active query when pi rewrites history under it (compaction).
+	 *  Set by the query that owns the context, cleared when it ends or is superseded. */
+	supersede: ((reason: string) => void) | null = null;
 	/** Streaming-input handle for the active query — how steers reach CC mid-turn. */
 	promptStream: PromptStream | null = null;
 	/** Last rate-limit rejection seen on this query. Claude Code sends it just before the

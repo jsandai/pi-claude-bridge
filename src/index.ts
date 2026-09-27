@@ -1570,6 +1570,12 @@ async function deliverToolResults(
  *  awaiting a subprocess we are about to kill. The pump abandons iteration on
  *  abort, so an in-flight prompt-stream push would hang forever and take
  *  tool-result delivery with it. */
+/** Detach the top-level query if one is still active. Reentrant subagent contexts are left
+ *  alone: they run their own transcripts, which a main-session compaction does not rewrite. */
+function supersedeTopLevelQuery(reason: string): void {
+	ctx().supersede?.(reason);
+}
+
 function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 	promptStream.fail(new Error("Operation aborted"));
 	c.releasePendingToolCalls("Operation aborted");
@@ -1872,6 +1878,41 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 	};
+	// A query can outlive pi's turn: when the model's last call is a tool that ends pi's
+	// agent loop (self_compact), CC stays parked on that MCP call until pi's NEXT provider
+	// call delivers the result. If pi compacts in between, that next call would take the
+	// tool-result path and steer the compacted context into the OLD, uncompacted CC
+	// session — the compaction never reaches the model, and query-done then records that
+	// session as current. Superseding detaches the query synchronously, so the next call
+	// is a fresh query that rebuilds from pi's compacted history. forceRotate because the
+	// dying CLI may still append to its jsonl.
+	let superseded = false;
+	queryCtx.supersede = (reason: string) => {
+		if (queryCtx.activeQuery !== sdkQuery) return;
+		superseded = true;
+		wasAborted = true;
+		debug(`${reason}: superseding active query, pendingHandlers=${queryCtx.pendingToolCalls.size}, piStreamOpen=${queryCtx.currentPiStream !== null}`);
+		queryCtx.supersede = null;
+		queryCtx.activeQuery = null;
+		activeQueryContexts.delete(queryCtx);
+		// Stale ids would route the parked call's result, still in pi's history, back here.
+		queryCtx.turnToolCallIds = [];
+		drainForAbort(queryCtx, promptStream);
+		if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
+		// pi is between turns when it compacts, so no stream should be open. If one is,
+		// end it now: once a new query claims this context, the old query must not touch it.
+		const openStream = queryCtx.currentPiStream;
+		if (openStream && queryCtx.turnOutput) {
+			queryCtx.turnOutput.stopReason = "aborted";
+			queryCtx.turnOutput.errorMessage = "Superseded by a history rewrite";
+			openStream.push({ type: "error", reason: "aborted", error: queryCtx.turnOutput });
+			markStreamComplete(openStream);
+			openStream.end();
+		}
+		queryCtx.currentPiStream = null;
+		if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+		requestAbort();
+	};
 	if (options?.signal) {
 		if (options.signal.aborted) onAbort();
 		else options.signal.addEventListener("abort", onAbort, { once: true });
@@ -1881,6 +1922,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
 		.then(async ({ capturedSessionId }) => {
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
+			// Superseded: detached already, and the context may belong to a newer query now.
+			if (superseded) {
+				debug("provider: superseded query ended");
+				return;
+			}
+			if (queryCtx.supersede) queryCtx.supersede = null;
 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
@@ -1908,8 +1955,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
-				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				sharedSession = { sessionId, cursor, cwd };
+				// syncSharedSession clears needsRebuild whenever it starts a query, so a flag
+				// present now was set by a history rewrite during this query. Overwriting it
+				// would resume a session that no longer matches pi's history.
+				const rebuild = sharedSession?.needsRebuild
+					? { needsRebuild: true, ...(sharedSession.forceRotate ? { forceRotate: true } : {}) }
+					: {};
+				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}${sharedSession?.needsRebuild ? ", keeping needsRebuild" : ""}`);
+				sharedSession = { sessionId, cursor, cwd, ...rebuild };
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -1920,6 +1973,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		})
 		.catch((error) => {
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
+			if (superseded) return;
+			if (queryCtx.supersede) queryCtx.supersede = null;
 			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
 			} else {
@@ -2283,6 +2338,9 @@ export default function (pi: ExtensionAPI) {
 		if (preparation && typeof preparation === "object") providedCompactions.add(preparation);
 	});
 	pi.on("session_before_compact", async (event, ctx) => {
+		// Before anything awaits: whoever supplies the summary, a query parked across this
+		// turn boundary must not receive the compacted context as a continuation.
+		supersedeTopLevelQuery(`session_before_compact:${event.reason}`);
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
 		if (providedCompactions.has(event.preparation)) {
 			debug(`session_before_compact: another extension supplied the compaction; deferring (reason=${event.reason})`);
@@ -2332,7 +2390,12 @@ export default function (pi: ExtensionAPI) {
 			sharedSession = { ...sharedSession, needsRebuild: true };
 		}
 	};
-	pi.on("session_compact", (event) => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`));
+	pi.on("session_compact", (event) => {
+		const label = `session_compact:${event.reason}:willRetry=${event.willRetry}`;
+		// Normally a no-op: session_before_compact already superseded it.
+		supersedeTopLevelQuery(label);
+		markRebuild(label);
+	});
 	pi.on("session_tree", () => markRebuild("session_tree"));
 
 	// An extension that rewrites earlier messages in place from its `context`
