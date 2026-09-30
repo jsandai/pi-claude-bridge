@@ -782,12 +782,22 @@ function syncSharedSession(
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
+	// The CC session now holds pi's current history (after a compaction, the compacted one). An extension that must know
+	// its rewrite reached the model (self-compact) waits for this; a REUSE never announces, because nothing changed.
+	emitOnBus?.(CONTEXT_INSTALLED_CHANNEL, { sessionId: session.sessionId, messageCount: priorMessages.length });
 	return { sessionId: session.sessionId };
 }
 
 /** pi.events channel an extension emits on after rewriting earlier messages in
  *  place (same count, changed content). Payload: { source, reason, sessionId? }. */
 export const CONTEXT_REWRITTEN_CHANNEL = "context:rewritten";
+
+/** pi.events channel the bridge emits on after a rebuild has written pi's current history into
+ *  the CC session. Payload: { sessionId, messageCount }. */
+export const CONTEXT_INSTALLED_CHANNEL = "context:installed";
+
+/** Emits on pi's shared event bus; set by the extension factory, null before it runs (unit tests). */
+let emitOnBus: ((channel: string, data: unknown) => void) | null = null;
 
 /** pi.events channel an extension emits on when its session_before_compact handler
  *  supplies the compaction. Payload: { source, preparation } — the event's own
@@ -796,7 +806,7 @@ export const COMPACTION_PROVIDED_CHANNEL = "compaction:provided";
 
 // @internal
 export const __test = {
-	channels: { CONTEXT_REWRITTEN_CHANNEL, COMPACTION_PROVIDED_CHANNEL },
+	channels: { CONTEXT_REWRITTEN_CHANNEL, COMPACTION_PROVIDED_CHANNEL, CONTEXT_INSTALLED_CHANNEL },
 	resetSharedSession() {
 		sharedSession = null;
 	},
@@ -2217,6 +2227,7 @@ const PREVIEW_MAX_LINES = 6;
 let askClaudeToolName = "AskClaude";
 
 export default function (pi: ExtensionAPI) {
+	emitOnBus = pi.events ? (channel, data) => pi.events.emit(channel, data) : null;
 	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 

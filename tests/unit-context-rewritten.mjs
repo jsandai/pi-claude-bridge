@@ -113,3 +113,49 @@ describe("compaction:provided", () => {
 		assert.notEqual(await handlers.get("session_before_compact")(abortedEvent(), bridgeCtx), undefined);
 	});
 });
+
+describe("context:installed", () => {
+	const { CONTEXT_INSTALLED_CHANNEL } = __test.channels;
+
+	function activateCapturing() {
+		const emitted = [];
+		const events = { on: () => () => {}, emit: (channel, data) => emitted.push({ channel, data }) };
+		activate({ on: () => {}, registerProvider: () => {}, registerTool: () => {}, events });
+		return emitted;
+	}
+
+	it("uses the documented channel name", () => {
+		assert.equal(CONTEXT_INSTALLED_CHANNEL, "context:installed");
+	});
+
+	it("is announced when a rebuild writes pi's history into the CC session, and not on a reuse", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { randomUUID } = await import("node:crypto");
+		const { createSession } = await import("cc-session-io");
+		const emitted = activateCapturing();
+		const cwd = mkdtempSync(join(tmpdir(), "context-installed-"));
+		const sessionId = randomUUID();
+		try {
+			const seeded = createSession({ sessionId, projectPath: cwd });
+			seeded.importMessages([{ role: "user", content: "Hi" }, { role: "assistant", content: [{ type: "text", text: "Hello." }] }]);
+			seeded.save();
+			const history = [
+				{ role: "user", content: "summary of the compacted span", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "noted" }], timestamp: Date.now() },
+				{ role: "user", content: "resume", timestamp: Date.now() },
+			];
+			__test.setSharedSession({ sessionId, cursor: 2, cwd, needsRebuild: true });
+			__test.syncSharedSession(history, cwd);
+			const installs = emitted.filter((e) => e.channel === CONTEXT_INSTALLED_CHANNEL);
+			assert.equal(installs.length, 1, "one announcement for the rebuild");
+			assert.equal(installs[0].data.messageCount, 2);
+			__test.syncSharedSession([...history.slice(0, 2), { role: "user", content: "resume", timestamp: Date.now() }], cwd);
+			assert.equal(emitted.filter((e) => e.channel === CONTEXT_INSTALLED_CHANNEL).length, 1, "a reuse changes nothing, so it announces nothing");
+		} finally {
+			__test.resetSharedSession();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+});
