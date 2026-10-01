@@ -91,6 +91,8 @@ const MEASURED_ONE_M = new Set([
 // Measured exceptions: pi-ai declares 1M and the [1m] id works, but only when
 // the plan allows it.
 const PLAN_GATED_ONE_M: Record<string, (settings: LongContextSettings) => boolean> = {
+	// [1m] measured 1M on Max (2026-10-01, diag/context-size.mjs); Pro not measured yet, so it stays 200K there.
+	"claude-sonnet-5-5": (settings) => settings.plan === "max",
 	// [1m] measured 1M on Max plan / extra usage; 429 on Pro without it.
 	"claude-opus-4-6": (settings) => settings.plan === "max" || settings.longContextExtraUsage,
 	// [1m] measured 1M with extra usage only.
