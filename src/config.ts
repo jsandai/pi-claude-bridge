@@ -81,8 +81,35 @@ export function markStartupNoticeShown(): string {
 	return path;
 }
 
-export function loadConfig(cwd: string): Config {
+/** Contained mode: set by a harness (pi-submission's isolated path) that runs pi as an untrusted worker whose
+ *  every local operation goes through sandboxed pi tools. Claude Code is then only a model endpoint: no settings
+ *  sources (so no user/project hooks, plugins, status line or permissions), hooks disabled outright, a minimal
+ *  environment, no project bridge config (a workspace can't enable AskClaude or point the bridge at another
+ *  `claude` binary), and AskClaude never registered. Off unless the variable is exactly "1". */
+export const CONTAINED_ENV = "PI_CLAUDE_BRIDGE_CONTAINED";
+export const isContained = (env: NodeJS.ProcessEnv = process.env): boolean => env[CONTAINED_ENV] === "1";
+
+const CONTAINED_KEEP = new Set([
+	"HOME", "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR",
+	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+	"SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+	// where Claude Code finds its own login; nothing else of the parent's reaches it
+	"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
+]);
+/** The parent environment cut to what Claude Code needs to start and authenticate. */
+export function containedEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(env))
+		if (v !== undefined && (CONTAINED_KEEP.has(k) || k.startsWith("LC_") || k.startsWith("XDG_"))) out[k] = v;
+	return out;
+}
+
+export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): Config {
 	const global = tryParseJson(globalConfigPath());
+	if (isContained(env)) {
+		const { pathToClaudeCodeExecutable: _drop, ...provider } = (global.provider ?? {}) as NonNullable<Config["provider"]>;
+		return { startupNoticeShown: global.startupNoticeShown, askClaude: {}, provider };
+	}
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
 	return {
 		startupNoticeShown: project.startupNoticeShown ?? global.startupNoticeShown,

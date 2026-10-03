@@ -92,7 +92,21 @@ export function makePromptStream(): PromptStream {
 
 /** `uuid` is deliberately omitted: we need no dedup, and supplying one makes
  *  CC's stdin loop do a session lookup on the message. */
+/** Claude Code expands `@path` in user text by reading the file itself, `tools: []` or not (verified 2026-10-02:
+ *  `@/tmp/x` in a prompt put the host file's content in front of the model). In contained mode the prompt can carry
+ *  worker-controlled text, so every `@` that could open a mention gets a zero-width space after it: the model
+ *  still reads `@`, Claude Code no longer sees a path. */
+export const neutralizeMentions = (text: string): string => text.replace(/@(?=\S)/g, "@\u200b");
+
+function containedContent(content: SDKUserMessage["message"]["content"]): SDKUserMessage["message"]["content"] {
+	if (typeof content === "string") return neutralizeMentions(content);
+	return (content as Array<{ type: string; text?: string }>).map((b) =>
+		b.type === "text" && typeof b.text === "string" ? { ...b, text: neutralizeMentions(b.text) } : b,
+	) as SDKUserMessage["message"]["content"];
+}
+
 export function userMessage(content: SDKUserMessage["message"]["content"], priority?: SDKUserMessage["priority"]): SDKUserMessage {
+	if (process.env.PI_CLAUDE_BRIDGE_CONTAINED === "1") content = containedContent(content);
 	return {
 		type: "user",
 		message: { role: "user", content } as SDKUserMessage["message"],

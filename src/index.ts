@@ -14,8 +14,8 @@ import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
-import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
-import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { makePromptStream, neutralizeMentions, userMessage, type PromptStream } from "./prompt-stream.js";
+import { claudeCodeSettings, containedEnv, isContained, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
 	collectPromptSkills,
 	projectPromptCapture,
@@ -514,11 +514,11 @@ async function runIsolatedSummary(
 		debug(`${label}: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
 		sdkQuery = query({
-			prompt: promptText,
+			prompt: isContained() ? neutralizeMentions(promptText) : promptText,
 			options: {
 				cwd,
-				env: { ...process.env, ...CC_CHILD_ENV },
-				settings: { autoMemoryEnabled: false },
+				env: { ...(isContained() ? containedEnv(process.env) : process.env), ...CC_CHILD_ENV },
+				settings: { autoMemoryEnabled: false, ...(isContained() ? { disableAllHooks: true } : {}) },
 				tools: [],
 				strictMcpConfig: true,
 				settingSources: [] as SettingSource[],
@@ -1829,7 +1829,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV };
+	const contained = isContained();
+	const childEnv = { ...(contained ? containedEnv(process.env) : process.env), ...CC_CHILD_ENV };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -1849,7 +1850,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			...claudeCodeSettings(providerSettings),
 			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
 			includeGitInstructions: false,
+			...(contained ? { disableAllHooks: true } : {}),
 		},
+		// Contained: no user/project/local settings at all, so none of their hooks, plugins or status line run.
+		...(contained ? { settingSources: [] as SettingSource[] } : {}),
 		systemPrompt: {
 			type: "preset", preset: "claude_code",
 			append: systemPromptAppend ? systemPromptAppend : undefined,
@@ -2513,7 +2517,7 @@ export default function (pi: ExtensionAPI) {
 	const askDefaults = resolveAskClaudeDefaults(askConf);
 	askClaudeToolName = askConf?.name ?? "AskClaude";
 
-	if (askConf?.enabled) {
+	if (askConf?.enabled && !isContained()) {
 		const askClaudeParams = buildAskClaudeParams(askDefaults);
 		pi.registerTool<typeof askClaudeParams>({
 			name: askConf?.name ?? "AskClaude",
