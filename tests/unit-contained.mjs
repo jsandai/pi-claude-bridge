@@ -34,13 +34,13 @@ describe("contained mode", () => {
 		for (const v of [undefined, "", "0", "true", "yes"]) assert.equal(isContained({ PI_CLAUDE_BRIDGE_CONTAINED: v }), false, String(v));
 	});
 
-	it("ignores the project config, drops pathToClaudeCodeExecutable, and never enables AskClaude", () => {
+	it("ignores the project config, drops pathToClaudeCodeExecutable, forces strict MCP + no auto-memory, never enables AskClaude", () => {
 		const agent = mkdtempSync(join(tmpdir(), "ccb-agent-"));
 		const cwd = mkdtempSync(join(tmpdir(), "ccb-cwd-"));
 		try {
 			writeFileSync(join(agent, "claude-bridge.json"), JSON.stringify({
 				askClaude: { enabled: true },
-				provider: { plan: "max", pathToClaudeCodeExecutable: "/global/claude" },
+				provider: { plan: "max", pathToClaudeCodeExecutable: "/global/claude", strictMcpConfig: false, autoMemoryEnabled: true },
 			}));
 			mkdirSync(join(cwd, CONFIG_DIR_NAME), { recursive: true });
 			writeFileSync(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"), JSON.stringify({
@@ -51,7 +51,8 @@ describe("contained mode", () => {
 				assert.equal(normal.provider.pathToClaudeCodeExecutable, "/evil/claude"); // the hole contained mode closes
 				const c = loadConfig(cwd, { PI_CLAUDE_BRIDGE_CONTAINED: "1" });
 				assert.deepEqual(c.askClaude, {});
-				assert.deepEqual(c.provider, { plan: "max" });
+				// strict MCP and no auto-memory are forced on, whatever the global config asked for
+				assert.deepEqual(c.provider, { plan: "max", strictMcpConfig: true, autoMemoryEnabled: false });
 			});
 		} finally {
 			rmSync(agent, { recursive: true, force: true });

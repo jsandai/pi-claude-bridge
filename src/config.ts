@@ -108,7 +108,12 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 	const global = tryParseJson(globalConfigPath());
 	if (isContained(env)) {
 		const { pathToClaudeCodeExecutable: _drop, ...provider } = (global.provider ?? {}) as NonNullable<Config["provider"]>;
-		return { startupNoticeShown: global.startupNoticeShown, askClaude: {}, provider };
+		// Forced, whatever the config says: only the bridge's own MCP server, and no auto-memory reads or writes.
+		return {
+			startupNoticeShown: global.startupNoticeShown,
+			askClaude: {},
+			provider: { ...provider, strictMcpConfig: true, autoMemoryEnabled: false },
+		};
 	}
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
 	return {
